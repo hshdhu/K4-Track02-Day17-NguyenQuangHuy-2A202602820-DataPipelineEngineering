@@ -6,7 +6,7 @@ Phần phân tích tối đa một trang, không tính output ở phần 5.
 **Họ tên / MSSV:**
 **Repo:**
 **Commit bài nộp:**
-**AI đã dùng và phạm vi hỗ trợ (hoặc không dùng):** OpenAI Codex hỗ trợ đọc log, đối chiếu seed và ghi nhận CP0; chưa sửa logic pipeline. Học viên cần review và giải thích nội dung.
+**AI đã dùng và phạm vi hỗ trợ (hoặc không dùng):** OpenAI Codex hỗ trợ ghi nhận baseline CP0; ở CP1 hỗ trợ sửa keyed MERGE/LSN guard trong `pipeline/silver.py`, chạy tests và kiểm tra replay. Học viên cần review và giải thích nội dung cùng thay đổi code.
 **Nguồn tham khảo khác (nếu có):**
 
 ## 1. Ba lỗi
@@ -17,9 +17,9 @@ checksum nào lệch) — không phải cách sửa.
 | | Lỗi Silver | Lỗi late data | Lỗi xoá (CDC) |
 |---|---|---|---|
 | **Triệu chứng** | Silver có 24 hàng / 12 ticket; T-91 giữ cả 3 trạng thái thay vì chỉ `high / closed / bug`. | u05 ngày 2026-08-12 có `(2 events, 1 click, 0 feedback down)`, kỳ vọng `(5, 3, 1)`; feature khác full recompute. | T-97 còn 2 hàng chưa xoá và dữ liệu cá nhân; snapshot mới nhất còn 1 hàng, RAG còn 2 chunks. |
-| **Nguyên nhân gốc** | | | |
-| **Cách sửa** (file, vài dòng) | | | |
-| **Khái niệm trên slide** | | | |
+| **Nguyên nhân gốc** | Dedup theo LSN chỉ chọn thay đổi cuối trong một batch; `INSERT` vẫn thêm hàng qua nhiều batch, không đối chiếu khoá/trạng thái hiện tại. | | |
+| **Cách sửa** (file, vài dòng) | `pipeline/silver.py::upsert_silver_tickets`: MERGE theo `ticket_id`; insert khoá mới, update mọi cột trạng thái/lineage chỉ khi `s._lsn > t._lsn`. LSN bằng hoặc thấp hơn không thay đổi hàng. | | |
+| **Khái niệm trên slide** | Một thực thể/một hàng hiện tại; keyed upsert/MERGE; CDC LSN guard bảo đảm idempotency và chống replay cũ ghi đè trạng thái mới. | | |
 
 ## 2. Các con số
 
@@ -42,6 +42,26 @@ checksum nào lệch) — không phải cách sửa.
    đặt chốt PII nào, ở tầng nào, và đo nó ra sao?
 
 ## 5. Output (dán nguyên văn)
+
+### CP1 — Một ticket, một trạng thái hiện tại
+
+Hai tests yêu cầu đã pass. Kiểm tra thêm trên DuckDB in-memory đọc Bronze hiện có: Silver có 12 hàng / 12 ticket; T-91 là `high / closed / bug`, LSN `24024000`. Sau khi xử lý đủ bảy ngày, replay lần lượt 08-12, 08-14, 08-16, 08-12 không thay đổi bất kỳ cột nào của toàn bộ bảng ticket. `_lsn` lấy từ `value.source.lsn` là thứ tự CDC để quyết định update, không dùng ngày chạy batch. Cần fresh build để dựng lại warehouse baseline vốn đã có hàng trùng; thay đổi này bảo đảm các lần ghi vào bảng sạch duy trì một hàng mỗi khoá. Late data/delete/chunks sẽ xử lý ở checkpoint sau; checksum mục 2 là bằng chứng CP0.
+
+Lần chạy pytest đầu bị sandbox chặn quyền thư mục tạm; output dưới đây là lần chạy lại thành công với quyền cần thiết.
+
+```text
+$ .\.venv\Scripts\python.exe -m pytest tests/test_contracts.py -k "one_row_per_ticket or latest_state_wins"
+..                                                                       [100%]
+2 passed, 11 deselected in 1.19s
+```
+
+Output kiểm tra replay trực tiếp (assert toàn bộ hàng/cột trước và sau bằng nhau):
+
+```text
+Silver rows / distinct tickets: (12, 12)
+T-91 priority / status / category / LSN: [('high', 'closed', 'bug', 24024000)]
+Replay older/equal LSN batches: PASS (all Silver ticket columns unchanged)
+```
 
 ### CP0 — Ghi nhận baseline trước khi sửa
 
