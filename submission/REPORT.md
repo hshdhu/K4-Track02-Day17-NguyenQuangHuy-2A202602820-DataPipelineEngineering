@@ -6,7 +6,7 @@ Phần phân tích tối đa một trang, không tính output ở phần 5.
 **Họ tên / MSSV:**
 **Repo:**
 **Commit bài nộp:**
-**AI đã dùng và phạm vi hỗ trợ (hoặc không dùng):** OpenAI Codex hỗ trợ ghi nhận baseline CP0; ở CP1 hỗ trợ sửa keyed MERGE/LSN guard trong `pipeline/silver.py`, chạy tests và kiểm tra replay. Học viên cần review và giải thích nội dung cùng thay đổi code.
+**AI đã dùng và phạm vi hỗ trợ (hoặc không dùng):** OpenAI Codex hỗ trợ ghi nhận CP0, sửa MERGE/LSN guard ở CP1, đo lateness và đặt lookback ở CP2, chạy tests/đối chiếu kết quả và cập nhật REPORT. Học viên cần review và giải thích nội dung cùng thay đổi code.
 **Nguồn tham khảo khác (nếu có):**
 
 ## 1. Ba lỗi
@@ -17,19 +17,19 @@ checksum nào lệch) — không phải cách sửa.
 | | Lỗi Silver | Lỗi late data | Lỗi xoá (CDC) |
 |---|---|---|---|
 | **Triệu chứng** | Silver có 24 hàng / 12 ticket; T-91 giữ cả 3 trạng thái thay vì chỉ `high / closed / bug`. | u05 ngày 2026-08-12 có `(2 events, 1 click, 0 feedback down)`, kỳ vọng `(5, 3, 1)`; feature khác full recompute. | T-97 còn 2 hàng chưa xoá và dữ liệu cá nhân; snapshot mới nhất còn 1 hàng, RAG còn 2 chunks. |
-| **Nguyên nhân gốc** | Dedup theo LSN chỉ chọn thay đổi cuối trong một batch; `INSERT` vẫn thêm hàng qua nhiều batch, không đối chiếu khoá/trạng thái hiện tại. | | |
-| **Cách sửa** (file, vài dòng) | `pipeline/silver.py::upsert_silver_tickets`: MERGE theo `ticket_id`; insert khoá mới, update mọi cột trạng thái/lineage chỉ khi `s._lsn > t._lsn`. LSN bằng hoặc thấp hơn không thay đổi hàng. | | |
-| **Khái niệm trên slide** | Một thực thể/một hàng hiện tại; keyed upsert/MERGE; CDC LSN guard bảo đảm idempotency và chống replay cũ ghi đè trạng thái mới. | | |
+| **Nguyên nhân gốc** | Dedup theo LSN chỉ chọn thay đổi cuối trong một batch; `INSERT` vẫn thêm hàng qua nhiều batch, không đối chiếu khoá/trạng thái hiện tại. | `LOOKBACK_DAYS=0` chỉ tính lại ngày chạy; batch 08-15 không cập nhật partition 08-12 dù Silver đã nhận event muộn. | |
+| **Cách sửa** (file, vài dòng) | `pipeline/silver.py::upsert_silver_tickets`: MERGE theo `ticket_id`; insert khoá mới, update mọi cột trạng thái/lineage chỉ khi `s._lsn > t._lsn`. LSN bằng hoặc thấp hơn không thay đổi hàng. | `pipeline/config.py`: đặt `LOOKBACK_DAYS=3 = ceil(P99)`. `gold.py` đã lọc/gom nhóm theo `CAST(event_time AS DATE)` và overwrite cửa sổ; không cần đổi SQL. | |
+| **Khái niệm trên slide** | Một thực thể/một hàng hiện tại; keyed upsert/MERGE; CDC LSN guard bảo đảm idempotency và chống replay cũ ghi đè trạng thái mới. | Event time khác ingest time; lookback đo từ Bronze và overwrite-partition nhận late data đúng ngày xảy ra. | |
 
 ## 2. Các con số
 
-- Lateness từ **43 bản ghi Bronze**, theo ngày lịch: **P50 = 0,00; P95 = 2,90; P99 = 3,00; max = 3 ngày**. Baseline có `LOOKBACK_DAYS = 0`; số đo yêu cầu ít nhất `ceil(P99) = 3` ngày (chưa sửa ở CP0).
+- Lateness đo lại ở CP2 từ **43 bản ghi Bronze**, theo ngày lịch: **P50 = 0,00; P95 = 2,90; P99 = 3,00; max = 3 ngày**. Chọn `LOOKBACK_DAYS = ceil(3,00) = 3`; làm tròn lên để không bỏ hụt ngày nếu P99 có phần lẻ. Baseline CP0 là 0.
 - `submission/checksums.txt`: **FAIL** — Gold fresh build: `f90edc98a9c0d5c6f5ef168dd422fe88`; cả ba rerun 2026-08-12 khác fresh build.
 - dbt/parity: chưa chạy trong bằng chứng CP0.
 
 ## 3. Lựa chọn công cụ / kỹ thuật (mỗi dòng một câu "vì sao")
 
-- MERGE theo khoá cho `silver_tickets`, overwrite-partition cho `gold_feature_daily`:
+- MERGE theo khoá cho `silver_tickets`, overwrite-partition cho `gold_feature_daily`: MERGE giữ một trạng thái mới nhất theo LSN; overwrite tính lại tổng từ Silver cho cả cửa sổ nên nhận event muộn mà không cộng trùng khi rerun.
 - Tombstone thay vì xoá hẳn hàng trong Silver:
 - Snapshot training dựng lại từ Bronze "as of" ngày đó, không sửa snapshot cũ:
 - DuckDB (lite) / dbt (track dbt) cho bài toán cỡ này, chứ không phải Spark:
@@ -42,6 +42,28 @@ checksum nào lệch) — không phải cách sửa.
    đặt chốt PII nào, ở tầng nào, và đo nó ra sao?
 
 ## 5. Output (dán nguyên văn)
+
+### CP2 — Feature theo ngày xảy ra sự kiện
+
+`event_time` là lúc sự kiện xảy ra; `_ingested_at` là lúc bản ghi đến Bronze. Ba event u05 xảy ra 08-12, đến 08-15 vẫn phải thuộc `event_date=2026-08-12`. Lookback 3 ngày cho cửa sổ bao gồm hai đầu `[08-12, 08-15]` khi chạy ngày 08-15. P99 và max đều là 3 trong seed này; dữ liệu thực trễ vượt cửa sổ cần backfill và theo dõi lateness lại.
+
+```text
+$ .\.venv\Scripts\python.exe main.py --lateness
+event lateness over 43 Bronze records (calendar days): p50=0.00 p95=2.90 p99=3.00 max=3
+-> lookback must be >= ceil(p99) = 3 day(s); config.LOOKBACK_DAYS = 3
+
+$ .\.venv\Scripts\python.exe -m pytest tests/test_contracts.py -k "feature_daily or late_events or lookback"
+...                                                                      [100%]
+3 passed, 10 deselected in 1.26s
+```
+
+Kiểm tra trực tiếp trên DuckDB in-memory: đọc từng batch Bronze, upsert events và tính feature theo ngày; assert kết quả u05 và checksum bằng full recompute:
+
+```text
+u05 / 2026-08-12 (events, clicks, feedback down): [(5, 3, 1)]
+Feature checksum: 8630e04a61d10aa963b7a49e148926b0
+Full recompute checksum: 8630e04a61d10aa963b7a49e148926b0
+```
 
 ### CP1 — Một ticket, một trạng thái hiện tại
 
