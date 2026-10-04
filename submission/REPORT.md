@@ -6,7 +6,7 @@ Phần phân tích tối đa một trang, không tính output ở phần 5.
 **Họ tên / MSSV:**
 **Repo:**
 **Commit bài nộp:**
-**AI đã dùng và phạm vi hỗ trợ (hoặc không dùng):** OpenAI Codex hỗ trợ ghi nhận CP0, sửa MERGE/LSN guard ở CP1, đo lateness và đặt lookback ở CP2, chạy tests/đối chiếu kết quả và cập nhật REPORT. Học viên cần review và giải thích nội dung cùng thay đổi code.
+**AI đã dùng và phạm vi hỗ trợ (hoặc không dùng):** OpenAI Codex hỗ trợ ghi nhận CP0, sửa MERGE/LSN guard ở CP1, đặt lookback ở CP2, sửa parser CDC delete ở CP3, chạy kiểm tra và cập nhật REPORT. Học viên cần review và giải thích nội dung cùng thay đổi code.
 **Nguồn tham khảo khác (nếu có):**
 
 ## 1. Ba lỗi
@@ -17,31 +17,83 @@ checksum nào lệch) — không phải cách sửa.
 | | Lỗi Silver | Lỗi late data | Lỗi xoá (CDC) |
 |---|---|---|---|
 | **Triệu chứng** | Silver có 24 hàng / 12 ticket; T-91 giữ cả 3 trạng thái thay vì chỉ `high / closed / bug`. | u05 ngày 2026-08-12 có `(2 events, 1 click, 0 feedback down)`, kỳ vọng `(5, 3, 1)`; feature khác full recompute. | T-97 còn 2 hàng chưa xoá và dữ liệu cá nhân; snapshot mới nhất còn 1 hàng, RAG còn 2 chunks. |
-| **Nguyên nhân gốc** | Dedup theo LSN chỉ chọn thay đổi cuối trong một batch; `INSERT` vẫn thêm hàng qua nhiều batch, không đối chiếu khoá/trạng thái hiện tại. | `LOOKBACK_DAYS=0` chỉ tính lại ngày chạy; batch 08-15 không cập nhật partition 08-12 dù Silver đã nhận event muộn. | |
-| **Cách sửa** (file, vài dòng) | `pipeline/silver.py::upsert_silver_tickets`: MERGE theo `ticket_id`; insert khoá mới, update mọi cột trạng thái/lineage chỉ khi `s._lsn > t._lsn`. LSN bằng hoặc thấp hơn không thay đổi hàng. | `pipeline/config.py`: đặt `LOOKBACK_DAYS=3 = ceil(P99)`. `gold.py` đã lọc/gom nhóm theo `CAST(event_time AS DATE)` và overwrite cửa sổ; không cần đổi SQL. | |
-| **Khái niệm trên slide** | Một thực thể/một hàng hiện tại; keyed upsert/MERGE; CDC LSN guard bảo đảm idempotency và chống replay cũ ghi đè trạng thái mới. | Event time khác ingest time; lookback đo từ Bronze và overwrite-partition nhận late data đúng ngày xảy ra. | |
+| **Nguyên nhân gốc** | Dedup theo LSN chỉ chọn thay đổi cuối trong một batch; `INSERT` vẫn thêm hàng qua nhiều batch, không đối chiếu khoá/trạng thái hiện tại. | `LOOKBACK_DAYS=0` chỉ tính lại ngày chạy; batch 08-15 không cập nhật partition 08-12 dù Silver đã nhận event muộn. | Parser chỉ lấy khoá từ `after`; delete có `after=null` nên bị lọc mất trước khi đến Silver/Gold. |
+| **Cách sửa** (file, vài dòng) | `pipeline/silver.py::upsert_silver_tickets`: MERGE theo `ticket_id`; insert khoá mới, update mọi cột trạng thái/lineage chỉ khi `s._lsn > t._lsn`. LSN bằng hoặc thấp hơn không thay đổi hàng. | `pipeline/config.py`: đặt `LOOKBACK_DAYS=3 = ceil(P99)`. `gold.py` đã lọc/gom nhóm theo `CAST(event_time AS DATE)` và overwrite cửa sổ; không cần đổi SQL. | `pipeline/staging.py`: lấy khoá bằng coalesce(`key.ticket_id`, `after.ticket_id`, `before.ticket_id`); giữ op/LSN, cột từ after vẫn null. MERGE và Gold hiện có truyền xoá xuống snapshot mới/RAG. |
+| **Khái niệm trên slide** | Một thực thể/một hàng hiện tại; keyed upsert/MERGE; CDC LSN guard bảo đảm idempotency và chống replay cũ ghi đè trạng thái mới. | Event time khác ingest time; lookback đo từ Bronze và overwrite-partition nhận late data đúng ngày xảy ra. | CDC delete khác Kafka tombstone; giữ tombstone/LSN chống hồi sinh, xoá lan xuống dữ liệu phục vụ hiện tại. |
 
 ## 2. Các con số
 
 - Lateness đo lại ở CP2 từ **43 bản ghi Bronze**, theo ngày lịch: **P50 = 0,00; P95 = 2,90; P99 = 3,00; max = 3 ngày**. Chọn `LOOKBACK_DAYS = ceil(3,00) = 3`; làm tròn lên để không bỏ hụt ngày nếu P99 có phần lẻ. Baseline CP0 là 0.
-- `submission/checksums.txt`: **FAIL** — Gold fresh build: `f90edc98a9c0d5c6f5ef168dd422fe88`; cả ba rerun 2026-08-12 khác fresh build.
-- dbt/parity: chưa chạy trong bằng chứng CP0.
+- `submission/checksums.txt` ở CP3: **PASS**, `C0 = C1 = C2 = C3 = 39e115c510ecdf526800eac227158a4f`. CP0 từng FAIL; output baseline được giữ ở mục 5.
+- Verify CP3: **18/18 — ALL PASS**; pytest: **34 passed**. dbt/parity: chưa chạy.
 
 ## 3. Lựa chọn công cụ / kỹ thuật (mỗi dòng một câu "vì sao")
 
 - MERGE theo khoá cho `silver_tickets`, overwrite-partition cho `gold_feature_daily`: MERGE giữ một trạng thái mới nhất theo LSN; overwrite tính lại tổng từ Silver cho cả cửa sổ nên nhận event muộn mà không cộng trùng khi rerun.
-- Tombstone thay vì xoá hẳn hàng trong Silver:
-- Snapshot training dựng lại từ Bronze "as of" ngày đó, không sửa snapshot cũ:
+- Tombstone thay vì xoá hẳn hàng trong Silver: giữ khoá và LSN của delete để replay bản cũ không tái tạo ticket, trong khi user/subject/body đã null.
+- Snapshot training dựng lại từ Bronze "as of" ngày đó, không sửa snapshot cũ: tái lập dữ liệu đã biết tại thời điểm huấn luyện; snapshot mới loại ticket đã xoá mà không thay lịch sử lab.
 - DuckDB (lite) / dbt (track dbt) cho bài toán cỡ này, chứ không phải Spark:
 
 ## 4. Hai câu hỏi suy ngẫm
 
 1. Snapshot `v2026-08-12`..`v2026-08-14` vẫn chứa văn bản của T-97 (đã bị xoá ngày
    08-15). "Snapshot bất biến" và "quyền được xoá dữ liệu" mâu thuẫn — bạn xử lý thế nào?
+   Trong lab, giữ snapshot cũ để tái lập, loại T-97 khỏi snapshot mới nhất và RAG. Production cần quy trình xoá được kiểm toán xuyên suốt Bronze, snapshot cũ, cache, bản sao/backup và dữ liệu huấn luyện; thu hồi phiên bản chứa PII, dựng phiên bản đã làm sạch và đánh giá huấn luyện lại. Bất biến phục vụ tái lập không đồng nghĩa giữ PII mãi; kết quả lab chưa chứng minh xoá PII đầy đủ.
 2. Regex che được email và số điện thoại, nhưng tên "Nguyễn Văn An" vẫn còn. Bạn sẽ
    đặt chốt PII nào, ở tầng nào, và đo nó ra sao?
 
 ## 5. Output (dán nguyên văn)
+
+### CP3 — Xoá truyền xuống Gold và rerun ổn định
+
+CDC delete T-97 có khoá ở `key.ticket_id` và `before.ticket_id`, LSN `24020000`, `op=d`; Kafka tombstone kế tiếp có `value=null`, không mang thay đổi CDC/LSN và vẫn được giữ ở Bronze. Chỉ phục hồi khoá cho delete, không phục hồi PII từ before. Gold đã lọc delete khi dựng snapshot và dựng lại toàn bộ chunks từ ticket sống; không cần sửa `gold.py`. Cache embedding vẫn có thể giữ vector cũ, không coi đây là cơ chế xoá PII production.
+
+```text
+$ .\.venv\Scripts\python.exe -m scripts.verify
+=== verify.py — Day 17 pipeline contracts ===
+  [OK ] Bronze  every daily batch landed as Parquet (7 days x 3 sources)
+  [OK ] Bronze  re-landing a batch is a no-op (append-only, no duplicate file)
+  [OK ] Bronze  Bronze keeps the raw truth: Kafka tombstone + redelivered events are still there
+  [OK ] Silver  silver_tickets has exactly one row per ticket_id
+  [OK ] Silver  T-91 shows its latest state: high / closed / bug
+  [OK ] Silver  deleted ticket T-97 is a tombstone: is_deleted and no personal data left
+  [OK ] Silver  no email / phone number survives past Bronze
+  [OK ] Silver  silver_events has one row per event_id (Kafka redeliveries removed)
+  [OK ] Silver  2 malformed events quarantined with a reason; the run did not halt
+  [OK ] Gold    gold_feature_daily reconciles with a full recompute from Silver
+  [OK ] Gold    u05's offline events of 08-12 (arrived 08-15) are counted on 08-12
+  [OK ] Gold    LOOKBACK_DAYS covers measured P99 lateness (p99=3.00 days)
+  [OK ] Gold    training set uses point-in-time priority (T-91 created as 'low')
+  [OK ] Gold    late feedback creates a NEW snapshot version; the old one is untouched
+  [OK ] Gold    latest training snapshot excludes the deleted ticket T-97
+  [OK ] Gold    deletes propagate to the RAG index: no chunk of T-97
+  [OK ] Gold    gold_doc_chunks: one row per chunk, and a re-run embeds 0 new chunks
+  [OK ] Rerun   re-run 2026-08-12 three times -> Gold checksum identical to a fresh build
+
+RESULT: 18/18 checks — ALL PASS
+re-run checksums written to submission/checksums.txt
+
+$ .\.venv\Scripts\python.exe -m pytest
+..................................                                       [100%]
+34 passed in 2.84s
+
+$ .\.venv\Scripts\python.exe -m scripts.rerun_check
+# Lab 17 — re-run check for 2026-08-12
+
+run                     gold_feature_daily    gold_training_set     gold_doc_chunks       gold (combined)
+fresh build             8630e04a61d1          9370ca77af23          cb9ebd12fdcc          39e115c510ecdf526800eac227158a4f
+re-run #1 of 2026-08-12 8630e04a61d1          9370ca77af23          cb9ebd12fdcc          39e115c510ecdf526800eac227158a4f
+re-run #2 of 2026-08-12 8630e04a61d1          9370ca77af23          cb9ebd12fdcc          39e115c510ecdf526800eac227158a4f
+re-run #3 of 2026-08-12 8630e04a61d1          9370ca77af23          cb9ebd12fdcc          39e115c510ecdf526800eac227158a4f
+
+RESULT: PASS — 3 re-runs, identical checksums
+```
+
+Kiểm tra thêm trên DuckDB in-memory: xử lý bảy batch tickets rồi replay 08-12; assert T-97 vẫn giữ tombstone và LSN delete:
+
+```text
+T-97 after replay 2026-08-12: [(True, None, None, None, 24020000)]
+```
 
 ### CP2 — Feature theo ngày xảy ra sự kiện
 
