@@ -6,7 +6,7 @@ Phần phân tích tối đa một trang, không tính output ở phần 5.
 **Họ tên / MSSV:**
 **Repo:**
 **Commit bài nộp:**
-**AI đã dùng và phạm vi hỗ trợ (hoặc không dùng):** OpenAI Codex hỗ trợ ghi nhận CP0, sửa MERGE/LSN guard ở CP1, đặt lookback ở CP2, sửa parser CDC delete ở CP3, chạy kiểm tra và cập nhật REPORT. Học viên cần review và giải thích nội dung cùng thay đổi code.
+**AI đã dùng và phạm vi hỗ trợ (hoặc không dùng):** OpenAI Codex hỗ trợ ghi nhận CP0, sửa MERGE/LSN guard ở CP1, đặt lookback ở CP2, sửa parser CDC delete ở CP3, đọc/chạy dbt và parity ở CP4, chạy kiểm tra và cập nhật REPORT. Học viên cần review và giải thích nội dung cùng thay đổi code.
 **Nguồn tham khảo khác (nếu có):**
 
 ## 1. Ba lỗi
@@ -25,14 +25,14 @@ checksum nào lệch) — không phải cách sửa.
 
 - Lateness đo lại ở CP2 từ **43 bản ghi Bronze**, theo ngày lịch: **P50 = 0,00; P95 = 2,90; P99 = 3,00; max = 3 ngày**. Chọn `LOOKBACK_DAYS = ceil(3,00) = 3`; làm tròn lên để không bỏ hụt ngày nếu P99 có phần lẻ. Baseline CP0 là 0.
 - `submission/checksums.txt` ở CP3: **PASS**, `C0 = C1 = C2 = C3 = 39e115c510ecdf526800eac227158a4f`. CP0 từng FAIL; output baseline được giữ ở mục 5.
-- Verify CP3: **18/18 — ALL PASS**; pytest: **34 passed**. dbt/parity: chưa chạy.
+- Verify CP3: **18/18 — ALL PASS**; pytest: **34 passed**. CP4 dbt build: **PASS=19, WARN=0, ERROR=0**; parity: **PARITY** cho cả `silver_tickets` và `gold_feature_daily`.
 
 ## 3. Lựa chọn công cụ / kỹ thuật (mỗi dòng một câu "vì sao")
 
 - MERGE theo khoá cho `silver_tickets`, overwrite-partition cho `gold_feature_daily`: MERGE giữ một trạng thái mới nhất theo LSN; overwrite tính lại tổng từ Silver cho cả cửa sổ nên nhận event muộn mà không cộng trùng khi rerun.
 - Tombstone thay vì xoá hẳn hàng trong Silver: giữ khoá và LSN của delete để replay bản cũ không tái tạo ticket, trong khi user/subject/body đã null.
 - Snapshot training dựng lại từ Bronze "as of" ngày đó, không sửa snapshot cũ: tái lập dữ liệu đã biết tại thời điểm huấn luyện; snapshot mới loại ticket đã xoá mà không thay lịch sử lab.
-- DuckDB (lite) / dbt (track dbt) cho bài toán cỡ này, chứ không phải Spark:
+- DuckDB (lite) / dbt (track dbt) cho bài toán cỡ này, chứ không phải Spark: dữ liệu nhỏ chạy cục bộ, DuckDB đọc Parquet/SQL trực tiếp; dbt thêm model, contract và tests, chưa cần chi phí vận hành hệ phân tán.
 
 ## 4. Hai câu hỏi suy ngẫm
 
@@ -43,6 +43,105 @@ checksum nào lệch) — không phải cách sửa.
    đặt chốt PII nào, ở tầng nào, và đo nó ra sao?
 
 ## 5. Output (dán nguyên văn)
+
+### CP4 — Đối chiếu dbt
+
+Đã đọc project/profile và các model staging/silver/gold. Profile dùng DuckDB cục bộ `dbt.duckdb`, một thread; staging là view, Silver/Gold incremental. dbt đọc cùng Bronze, giữ delete qua khoá trong before, che PII và loại event sai contract. Parity chỉ đối chiếu hai bảng chung, không chứng minh dbt triển khai toàn bộ pipeline Python.
+
+- `unique_key='ticket_id'`: khoá khớp hàng trong incremental MERGE; dedup theo LSN chọn một thay đổi mới nhất mỗi ticket trước khi ghi.
+- `merge_update_condition`: chỉ cập nhật khi LSN nguồn lớn hơn đích, tránh replay cũ ghi đè trạng thái mới; model còn lọc incremental bằng high-water mark LSN.
+- `batch_size='day'`: feature chia thành microbatch một ngày theo event time, không theo ngày ingest.
+- `lookback=3`: chạy incremental xét lại ba batch trước để nhận late data, khớp `ceil(P99)=3` đo từ Bronze.
+
+Land Bronze xác nhận cả 21 batch nguồn/ngày đã tồn tại. Build dùng khoảng event time `[2026-08-10, 2026-08-17)`, nên đủ đến hết 08-16. Không sửa model hoặc checker: build và parity đã pass với cấu hình hiện có. Parity dựng lại Python trước khi so sánh. Output dbt dưới đây bỏ mã màu terminal, giữ nội dung; giờ là timestamp nguyên gốc của log.
+
+```powershell
+.\.venv\Scripts\python.exe main.py --land-only
+$env:DO_NOT_TRACK = '1'
+Push-Location dbt_project
+try {
+    ..\.venv\Scripts\dbt.exe build --profiles-dir . --event-time-start 2026-08-10 --event-time-end 2026-08-17
+} finally {
+    Pop-Location
+}
+```
+
+```text
+17:31:57  Running with dbt=1.12.5
+17:31:58  Registered adapter: duckdb=1.11.0
+17:31:58  Unable to do partial parsing because saved manifest not found. Starting full parse.
+17:32:03  Found 5 models, 13 data tests, 2 sources, 502 macros, 1 unit test
+17:32:03
+17:32:03  Concurrency: 1 threads (target='dev')
+17:32:03
+17:32:06  1 of 19 START sql view model main.stg_events ................................... [RUN]
+17:32:06  1 of 19 OK created sql view model main.stg_events .............................. [OK in 0.22s]
+17:32:06  2 of 19 START sql view model main.stg_ticket_changes ........................... [RUN]
+17:32:07  2 of 19 OK created sql view model main.stg_ticket_changes ...................... [OK in 0.06s]
+17:32:07  3 of 19 START sql incremental model main.silver_events ......................... [RUN]
+17:32:07  3 of 19 OK created sql incremental model main.silver_events .................... [OK in 0.14s]
+17:32:07  4 of 19 START unit_test silver_tickets::silver_tickets_latest_change_wins_and_delete_is_tombstone  [RUN]
+17:32:07  4 of 19 PASS silver_tickets::silver_tickets_latest_change_wins_and_delete_is_tombstone  [PASS in 0.24s]
+17:32:07  8 of 19 START sql incremental model main.silver_tickets ........................ [RUN]
+17:32:07  8 of 19 OK created sql incremental model main.silver_tickets ................... [OK in 0.11s]
+17:32:07  5 of 19 START test not_null_silver_events_event_id ............................. [RUN]
+17:32:07  5 of 19 PASS not_null_silver_events_event_id ................................... [PASS in 0.06s]
+17:32:07  6 of 19 START test not_null_silver_events_user_id .............................. [RUN]
+17:32:07  6 of 19 PASS not_null_silver_events_user_id .................................... [PASS in 0.03s]
+17:32:07  7 of 19 START test unique_silver_events_event_id ............................... [RUN]
+17:32:07  7 of 19 PASS unique_silver_events_event_id ..................................... [PASS in 0.03s]
+17:32:07  9 of 19 START test accepted_values_silver_tickets_category__bug__billing__other  [RUN]
+17:32:07  9 of 19 PASS accepted_values_silver_tickets_category__bug__billing__other ...... [PASS in 0.03s]
+17:32:07  10 of 19 START test accepted_values_silver_tickets_priority__low__medium__high . [RUN]
+17:32:07  10 of 19 PASS accepted_values_silver_tickets_priority__low__medium__high ....... [PASS in 0.03s]
+17:32:07  11 of 19 START test accepted_values_silver_tickets_status__open__pending__closed  [RUN]
+17:32:07  11 of 19 PASS accepted_values_silver_tickets_status__open__pending__closed ..... [PASS in 0.05s]
+17:32:07  12 of 19 START test not_null_silver_tickets__lsn ............................... [RUN]
+17:32:07  12 of 19 PASS not_null_silver_tickets__lsn ..................................... [PASS in 0.05s]
+17:32:07  13 of 19 START test not_null_silver_tickets_is_deleted ......................... [RUN]
+17:32:07  13 of 19 PASS not_null_silver_tickets_is_deleted ............................... [PASS in 0.03s]
+17:32:07  14 of 19 START test not_null_silver_tickets_ticket_id .......................... [RUN]
+17:32:07  14 of 19 PASS not_null_silver_tickets_ticket_id ................................ [PASS in 0.03s]
+17:32:07  15 of 19 START test unique_silver_tickets_ticket_id ............................ [RUN]
+17:32:07  15 of 19 PASS unique_silver_tickets_ticket_id .................................. [PASS in 0.03s]
+17:32:07  16 of 19 START sql microbatch model main.gold_feature_daily .................... [RUN]
+17:32:07  Batch 1 of 7 START batch 2026-08-10 of main.gold_feature_daily ....................... [RUN]
+17:32:08  Batch 1 of 7 OK created batch 2026-08-10 of main.gold_feature_daily .................. [OK in 0.07s]
+17:32:08  Batch 2 of 7 START batch 2026-08-11 of main.gold_feature_daily ....................... [RUN]
+17:32:08  Batch 2 of 7 OK created batch 2026-08-11 of main.gold_feature_daily .................. [OK in 0.09s]
+17:32:08  Batch 3 of 7 START batch 2026-08-12 of main.gold_feature_daily ....................... [RUN]
+17:32:08  Batch 3 of 7 OK created batch 2026-08-12 of main.gold_feature_daily .................. [OK in 0.05s]
+17:32:08  Batch 4 of 7 START batch 2026-08-13 of main.gold_feature_daily ....................... [RUN]
+17:32:08  Batch 4 of 7 OK created batch 2026-08-13 of main.gold_feature_daily .................. [OK in 0.08s]
+17:32:08  Batch 5 of 7 START batch 2026-08-14 of main.gold_feature_daily ....................... [RUN]
+17:32:08  Batch 5 of 7 OK created batch 2026-08-14 of main.gold_feature_daily .................. [OK in 0.04s]
+17:32:08  Batch 6 of 7 START batch 2026-08-15 of main.gold_feature_daily ....................... [RUN]
+17:32:08  Batch 6 of 7 OK created batch 2026-08-15 of main.gold_feature_daily .................. [OK in 0.06s]
+17:32:08  Batch 7 of 7 START batch 2026-08-16 of main.gold_feature_daily ....................... [RUN]
+17:32:08  Batch 7 of 7 OK created batch 2026-08-16 of main.gold_feature_daily .................. [OK in 0.07s]
+17:32:08  16 of 19 OK created sql microbatch model main.gold_feature_daily ............... [SUCCESS in 0.52s]
+17:32:08  17 of 19 START test dbt_utils_free_unique_combination_gold_feature_daily_user_id__event_date  [RUN]
+17:32:08  17 of 19 PASS dbt_utils_free_unique_combination_gold_feature_daily_user_id__event_date  [PASS in 0.03s]
+17:32:08  18 of 19 START test not_null_gold_feature_daily_event_date ..................... [RUN]
+17:32:08  18 of 19 PASS not_null_gold_feature_daily_event_date ........................... [PASS in 0.03s]
+17:32:08  19 of 19 START test not_null_gold_feature_daily_user_id ........................ [RUN]
+17:32:08  19 of 19 PASS not_null_gold_feature_daily_user_id .............................. [PASS in 0.03s]
+17:32:08
+17:32:08  Finished running 3 incremental models, 13 data tests, 1 unit test, 2 view models in 0 hours 0 minutes and 5.33 seconds (5.33s).
+17:32:08
+17:32:08  Completed successfully
+17:32:08
+17:32:08  Done. PASS=19 WARN=0 ERROR=0 SKIP=0 NO-OP=0 REUSED=0 TOTAL=19
+```
+
+```text
+$ .\.venv\Scripts\python.exe -m scripts.parity
+=== parity: lite pipeline vs dbt ===
+  [OK ] silver_tickets       lite 3c15dfd43701  dbt 3c15dfd43701
+  [OK ] gold_feature_daily   lite 8630e04a61d1  dbt 8630e04a61d1
+RESULT: PARITY — both implementations agree
+```
+
 
 ### CP3 — Xoá truyền xuống Gold và rerun ổn định
 
